@@ -1,0 +1,113 @@
+name: Auto-sync from connectors repo
+
+on:
+  schedule:
+    # Run twice daily at 9:00 AM and 9:00 PM UTC
+    - cron: '0 9,21 * * *'
+  workflow_dispatch: # Allow manual trigger for urgent releases
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync new releases from connectors repo
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mirror repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch tags from connectors repo
+        id: check-tags
+        run: |
+          # Get all php/pdo_pgsql/v* tags from connectors repo
+          CONNECTOR_TAGS=$(git ls-remote --tags https://github.com/awslabs/aurora-dsql-connectors.git 'refs/tags/php/pdo_pgsql/v*' | \
+            awk '{print $2}' | sed 's|refs/tags/||' | sort -V)
+
+          # Get existing version tags in mirror repo (v* format)
+          MIRROR_TAGS=$(git tag -l 'v*' | sort -V)
+
+          # Find new tags to sync
+          NEW_TAGS=""
+          for CONNECTOR_TAG in $CONNECTOR_TAGS; do
+            # Convert php/pdo_pgsql/v1.0.0 -> v1.0.0
+            MIRROR_TAG="${CONNECTOR_TAG#php/pdo_pgsql/}"
+
+            if ! echo "$MIRROR_TAGS" | grep -q "^${MIRROR_TAG}$"; then
+              NEW_TAGS="${NEW_TAGS}${CONNECTOR_TAG} "
+            fi
+          done
+
+          if [ -z "$NEW_TAGS" ]; then
+            echo "No new tags to sync"
+            echo "has_new_tags=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found new tags to sync: $NEW_TAGS"
+            echo "has_new_tags=true" >> "$GITHUB_OUTPUT"
+            echo "new_tags=$NEW_TAGS" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync new tags
+        if: steps.check-tags.outputs.has_new_tags == 'true'
+        run: |
+          for CONNECTOR_TAG in ${{ steps.check-tags.outputs.new_tags }}; do
+            echo "=== Syncing $CONNECTOR_TAG ==="
+
+            # Convert php/pdo_pgsql/v1.0.0 -> v1.0.0
+            VERSION_TAG="${CONNECTOR_TAG#php/pdo_pgsql/}"
+
+            # Clone connectors repo at specific tag with sparse checkout
+            TEMP_DIR=$(mktemp -d)
+            cd "$TEMP_DIR"
+
+            git clone --depth 1 --branch "$CONNECTOR_TAG" \
+              --filter=blob:none \
+              --sparse \
+              https://github.com/awslabs/aurora-dsql-connectors.git \
+              connectors
+
+            cd connectors
+            git sparse-checkout set php/pdo_pgsql
+
+            # Copy files to mirror repo root
+            cd "$GITHUB_WORKSPACE"
+
+            # Remove old files (except .git and .github)
+            find . -mindepth 1 -maxdepth 1 \
+              -not -name '.git' \
+              -not -name '.github' \
+              -exec rm -rf {} +
+
+            # Copy new files from php/pdo_pgsql/ to root
+            cp -r "$TEMP_DIR"/connectors/php/pdo_pgsql/* .
+
+            # Commit and tag
+            git add .
+            git commit -m "Sync from $CONNECTOR_TAG"
+            git tag "$VERSION_TAG"
+
+            # Push
+            git push origin main
+            git push origin "$VERSION_TAG"
+
+            # Cleanup
+            rm -rf "$TEMP_DIR"
+
+            echo "✓ Successfully synced $CONNECTOR_TAG as $VERSION_TAG"
+          done
+
+      - name: Summary
+        if: steps.check-tags.outputs.has_new_tags == 'true'
+        run: |
+          echo "Successfully synced the following releases:"
+          for CONNECTOR_TAG in ${{ steps.check-tags.outputs.new_tags }}; do
+            VERSION_TAG="${CONNECTOR_TAG#php/pdo_pgsql/}"
+            echo "  - $CONNECTOR_TAG → $VERSION_TAG"
+          done
